@@ -61,6 +61,14 @@ where
     async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         input
             .map(|mut event| {
+                // Arm finalizers so that if this event is abandoned anywhere downstream
+                // (Driver's next_batch, in-flight service future, etc.) without an explicit
+                // `update_status` call from the sink driver, its `Drop` reports `Errored` to
+                // the batch instead of the default `Dropped`. This converts silent
+                // shutdown-time losses into upstream-visible retries, which dd-agent can
+                // recover from. Scoped to this sink so other components are unaffected.
+                event.metadata().finalizers().arm_errored_on_drop();
+
                 let mut byte_size = telemetry().create_request_count_byte_size();
                 byte_size.add_event(&event, event.estimated_json_encoded_size_of());
 

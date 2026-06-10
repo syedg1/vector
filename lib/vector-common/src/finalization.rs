@@ -3,7 +3,17 @@
 //! as it flows through transforms, being duplicated and merged, and
 //! then report its status when the last copy is delivered or dropped.
 
-use std::{cmp, future::Future, mem, pin::Pin, sync::Arc, task::Poll};
+use std::{
+    cmp,
+    future::Future,
+    mem,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::Poll,
+};
 
 use crossbeam_utils::atomic::AtomicCell;
 use futures::future::FutureExt;
@@ -86,6 +96,19 @@ impl EventFinalizers {
         }
     }
 
+    /// Arms all finalizers in the collection so that an unobserved drop reports
+    /// `Errored` to their batches rather than the default `Dropped` (which would
+    /// silently leave the batch as `Delivered`).
+    ///
+    /// See [`EventFinalizer::arm_errored_on_drop`] for the full semantics. This is
+    /// the entry point a sink uses to opt its events into "abandonment = retryable
+    /// failure" handling.
+    pub fn arm_errored_on_drop(&self) {
+        for finalizer in &self.0 {
+            finalizer.arm_errored_on_drop();
+        }
+    }
+
     /// Consumes all event finalizers and updates their underlying batches immediately.
     pub fn update_sources(&mut self) {
         let finalizers = mem::take(&mut self.0);
@@ -113,6 +136,15 @@ impl std::iter::FromIterator<EventFinalizers> for EventFinalizers {
 pub struct EventFinalizer {
     status: AtomicCell<EventStatus>,
     batch: BatchNotifier,
+    /// When `true`, the `Drop` impl will upgrade a still-`Dropped` status to `Errored`
+    /// before reporting to the batch. This is opt-in so that events flowing through
+    /// components that consider "abandonment" a delivery failure (e.g., sinks that
+    /// must propagate retries to upstream sources) can surface as `Errored` rather
+    /// than silently as `Delivered` (the batch's default).
+    ///
+    /// Components that intentionally drop events (filter / route _unmatched / late
+    /// aggregate buckets / etc.) DO NOT arm this, so their drops remain silent.
+    arm_errored_on_drop: AtomicBool,
 }
 
 #[cfg(feature = "byte_size_of")]
@@ -129,7 +161,11 @@ impl EventFinalizer {
     #[must_use]
     pub fn new(batch: BatchNotifier) -> Self {
         let status = AtomicCell::new(EventStatus::Dropped);
-        Self { status, batch }
+        Self {
+            status,
+            batch,
+            arm_errored_on_drop: AtomicBool::new(false),
+        }
     }
 
     /// Updates the status of the event finalizer to `status`.
@@ -137,6 +173,20 @@ impl EventFinalizer {
         self.status
             .fetch_update(|old_status| Some(old_status.update(status)))
             .unwrap_or_else(|_| unreachable!());
+    }
+
+    /// Arms this finalizer so that if it is dropped while its status is still the
+    /// default `Dropped` (i.e., never explicitly set by a sink), the `Drop` impl
+    /// will upgrade the reported status to `Errored`. This signals an unintentional
+    /// loss to upstream sources so they can retry.
+    ///
+    /// Intended to be called by components — currently the `vector` and
+    /// `datadog_metrics` sinks — at the boundary where events enter the
+    /// component's processing pipeline. Once armed, the flag remains set
+    /// (it is not unset on explicit status updates because explicit updates
+    /// already change `status` away from `Dropped`, making the arm a no-op).
+    pub fn arm_errored_on_drop(&self) {
+        self.arm_errored_on_drop.store(true, Ordering::SeqCst);
     }
 
     /// Updates the underlying batch status with the status of the event finalizer.
@@ -153,6 +203,16 @@ impl EventFinalizer {
 
 impl Drop for EventFinalizer {
     fn drop(&mut self) {
+        // If this finalizer was armed by a sink and its status is still `Dropped`
+        // (meaning no explicit `update_status` from the sink driver fired), upgrade
+        // to `Errored` so the abandonment propagates to the source as a failure.
+        // Explicit Delivered/Errored/Rejected updates already moved status away
+        // from `Dropped`, so this check leaves them untouched.
+        if self.arm_errored_on_drop.load(Ordering::SeqCst) {
+            let _ = self.status.fetch_update(|status| {
+                (status == EventStatus::Dropped).then_some(EventStatus::Errored)
+            });
+        }
         self.update_batch();
     }
 }
@@ -406,6 +466,47 @@ mod tests {
     fn sends_notification() {
         let (fin, mut receiver) = make_finalizer();
         assert_eq!(receiver.try_recv(), Err(Empty));
+        drop(fin);
+        assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
+    }
+
+    #[test]
+    fn armed_finalizer_reports_errored_on_drop() {
+        // When `arm_errored_on_drop` is called (e.g., by a sink's input pipeline) and
+        // the finalizer is then dropped WITHOUT an explicit status update — meaning
+        // the sink never delivered or explicitly rejected — the batch sees `Errored`
+        // instead of the default `Delivered`. This is what surfaces silent loss as a
+        // retry-able failure to upstream sources.
+        let (fin, mut receiver) = make_finalizer();
+        fin.arm_errored_on_drop();
+        assert_eq!(receiver.try_recv(), Err(Empty));
+        drop(fin);
+        assert_eq!(receiver.try_recv(), Ok(BatchStatus::Errored));
+    }
+
+    #[test]
+    fn armed_finalizer_with_explicit_delivered_stays_delivered() {
+        // Arming does NOT corrupt the happy path. If a sink (vector / datadog_metrics)
+        // arms the finalizer on input and then successfully delivers, the explicit
+        // `update_status(Delivered)` moves status off the default `Dropped` BEFORE
+        // drop fires. The drop guard's `status == Dropped` check then short-circuits,
+        // leaving the reported status as `Delivered`.
+        let (mut fin, mut receiver) = make_finalizer();
+        fin.arm_errored_on_drop();
+        fin.update_status(EventStatus::Delivered);
+        drop(fin);
+        assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
+    }
+
+    #[test]
+    fn unarmed_finalizer_drop_remains_silent() {
+        // Components that do NOT arm (transforms, other sinks, etc.) preserve the
+        // pre-existing behavior: a drop without explicit status is reported as
+        // `Dropped` and the batch stays at its default `Delivered`. This keeps
+        // intentional drops (filter, route _unmatched, late aggregate events, etc.)
+        // silent so they don't trigger retry storms.
+        let (fin, mut receiver) = make_finalizer();
+        // Note: no `arm_errored_on_drop` call.
         drop(fin);
         assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
     }

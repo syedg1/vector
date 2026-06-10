@@ -103,6 +103,12 @@ where
         };
 
         input
+            // Arm finalizers so abandonment anywhere in this sink's processing pipeline
+            // (Driver's next_batch, in-flight HTTP requests, etc.) reports `Errored` to
+            // the source instead of silently as `Delivered`. Scoped to this sink so other
+            // components retain their existing silent-drop semantics for intentional
+            // discards. See `EventFinalizer::arm_errored_on_drop`.
+            .inspect(|event| event.metadata().finalizers().arm_errored_on_drop())
             // Convert `Event` to `Metric` so we don't have to deal with constant conversions.
             .filter_map(|event| ready(event.try_into_metric()))
             // Split aggregated summaries into individual metrics for count, sum, and the quantiles, which lets us
