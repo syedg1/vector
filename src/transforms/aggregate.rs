@@ -772,12 +772,10 @@ impl Aggregate {
                         }
                         output.push(Event::Metric(metric));
                     }
-
-                    self.event_time_prev_buckets.insert(bucket_key, bucket_map);
-                    // Keep only a small rolling window for diffing against the
-                    // immediately preceding bucket.
-                    let min_keep = bucket_key.saturating_sub(interval_ms);
-                    self.event_time_prev_buckets.retain(|&k, _| k >= min_keep);
+                    // NOTE: `bucket_map` is consumed by the consolidated insert
+                    // at the end of this iteration (search for "Only `Diff` mode
+                    // reads `event_time_prev_buckets`"). Don't insert here — it
+                    // would move `bucket_map` twice.
                 } else {
                     for (series, entry) in bucket_map {
                         let metric = Metric::from_parts(series, entry.0, entry.1);
