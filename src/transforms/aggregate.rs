@@ -772,10 +772,17 @@ impl Aggregate {
                         }
                         output.push(Event::Metric(metric));
                     }
-                    // NOTE: `bucket_map` is consumed by the consolidated insert
-                    // at the end of this iteration (search for "Only `Diff` mode
-                    // reads `event_time_prev_buckets`"). Don't insert here — it
-                    // would move `bucket_map` twice.
+                    // Retain this bucket as the "previous" for the next
+                    // window's diff. Done inside the Diff branch so the
+                    // compiler sees that `bucket_map` is consumed exactly
+                    // once on this path (the else branch consumes it via
+                    // `into_iter` instead). Putting this insert after the
+                    // outer if/else would make the borrow checker assume
+                    // both paths reach it, which the else branch can't.
+                    self.event_time_prev_buckets.insert(bucket_key, bucket_map);
+                    // Keep only a small rolling window for diffing.
+                    let min_keep = bucket_key.saturating_sub(interval_ms);
+                    self.event_time_prev_buckets.retain(|&k, _| k >= min_keep);
                 } else {
                     for (series, entry) in bucket_map {
                         let metric = Metric::from_parts(series, entry.0, entry.1);
@@ -838,16 +845,9 @@ impl Aggregate {
                     }
                 }
 
-                // Only `Diff` mode reads `event_time_prev_buckets` (in the
-                // flush loop above, gated on `AggregationMode::Diff`).
-                // Inserting unconditionally for other modes would leak —
-                // the entries would never be read and never be evicted.
-                if matches!(self.config.mode, AggregationMode::Diff) {
-                    self.event_time_prev_buckets.insert(bucket_key, bucket_map);
-                    // Keep only a small history window to compute the previous bucket diff.
-                    let min_keep = bucket_key.saturating_sub(interval_ms);
-                    self.event_time_prev_buckets.retain(|&k, _| k >= min_keep);
-                }
+                // The Diff branch above already inserted bucket_map into
+                // event_time_prev_buckets and pruned the history window.
+                // No further work needed here.
             }
 
             // Advance the watermark to the *exclusive end* of the highest
