@@ -2941,6 +2941,8 @@ time_source = "EventTime"
              possibly two during the transition); found {}",
             agg.event_time_prev_buckets.len(),
         );
+    }
+
     /// An event whose (kind, value) is incompatible with the configured
     /// aggregation mode (for example an `Incremental` event arriving at a
     /// `Mean`-configured aggregator) is dropped explicitly:
